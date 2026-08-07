@@ -12,6 +12,7 @@ license = { text = "MIT" }
 
 [project.scripts]
 book-to-skill = "book_to_skill.cli:main"
+research-to-skill = "book_to_skill.research:main"
 
 [project.optional-dependencies]
 epub = ["ebooklib", "beautifulsoup4"]
