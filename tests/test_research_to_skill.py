@@ -1,6 +1,8 @@
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
+import uuid
 
 import pytest
 
@@ -22,7 +24,9 @@ def test_init_creates_canonical_layout_and_skill(tmp_path):
     root = research.init_project("나의 연구", tmp_path / "workspace")
     data = manifest(root)
     assert data["schema_version"] == 1
-    assert data["project"] == {"name": "나의 연구", "slug": "research"}
+    assert data["project"]["name"] == "나의 연구"
+    assert data["project"]["slug"] == "research"
+    uuid.UUID(data["project"]["id"])
     for relative in research.PROJECT_DIRS:
         assert (root / relative).is_dir()
     assert (root / "relations/knowledge-graph.json").is_file()
@@ -230,3 +234,92 @@ def test_cli_help_and_workflow(tmp_path, capsys):
 def test_python39_compatible_annotations():
     source = Path(research.__file__).read_text(encoding="utf-8")
     assert " | None" not in source
+
+
+def test_lock_acquire_double_acquire_release_and_unicode_identity(tmp_path):
+    root = research.init_project("Corpus", tmp_path / "workspace")
+    lock = research.ProjectLock(root)
+    with mock.patch.object(
+        research, "_local_identity", return_value={"agent": "콜코", "machine": "연구-PC"}
+    ):
+        value = lock.acquire("코덱스", "semantic-write")
+        assert value["owner"] == "코덱스" and value["host"] == "연구-PC"
+        with pytest.raises(research.ResearchLockError, match="코덱스"):
+            lock.acquire("다른-agent", "compile")
+        lock.release("코덱스")
+    assert lock.status()["state"] == "unlocked"
+
+
+def test_stale_lock_requires_forced_break(tmp_path):
+    root = research.init_project("Corpus", tmp_path / "workspace")
+    lock = research.ProjectLock(root)
+    expired = datetime.now(timezone.utc) - timedelta(seconds=1)
+    (root / research.LOCK_NAME).write_text(json.dumps({
+        "schema_version": 1, "owner": "old", "host": "PC1", "pid": 1,
+        "operation": "compile", "created_at": expired.isoformat(),
+        "expires_at": expired.isoformat(),
+    }), encoding="utf-8")
+    assert lock.status()["state"] == "stale"
+    with pytest.raises(research.ResearchLockError, match="--force"):
+        lock.break_lock()
+    lock.break_lock(force=True)
+    assert lock.status()["state"] == "unlocked"
+
+
+def test_automatic_write_lock_blocks_and_cleans_up_after_exception(tmp_path):
+    root = research.init_project("Corpus", tmp_path / "workspace")
+    lock = research.ProjectLock(root)
+    lock.acquire("other", "semantic-write")
+    with pytest.raises(research.ResearchLockError):
+        research.compile_project(root)
+    lock.break_lock(force=True)
+    with mock.patch("book_to_skill.research._atomic_json", side_effect=OSError("boom")):
+        with pytest.raises(OSError, match="boom"):
+            research.compile_project(root)
+    assert lock.status()["state"] == "unlocked"
+
+
+def test_project_uuid_migration_is_persistent_and_preserves_ids(tmp_path):
+    root = research.init_project("Corpus", tmp_path / "workspace")
+    data = manifest(root)
+    del data["project"]["id"]
+    data["sources"] = [{"id": "source-stable"}]
+    (root / "research.json").write_text(json.dumps(data), encoding="utf-8")
+    first = research.ResearchProject(root).manifest
+    second = research.ResearchProject(root).manifest
+    uuid.UUID(first["project"]["id"])
+    assert first["project"]["id"] == second["project"]["id"]
+    assert second["sources"][0]["id"] == "source-stable"
+
+
+def test_preflight_ready_and_locked(tmp_path):
+    root = research.init_project("Corpus", tmp_path / "workspace")
+    ready = research.project_preflight(root)
+    assert ready["result"] == "READY" and ready["validation"] == "PASS"
+    lock = research.ProjectLock(root)
+    lock.acquire("codex", "semantic-write")
+    assert research.project_preflight(root)["result"] == "LOCKED"
+    lock.break_lock(force=True)
+
+
+def test_handoff_generation_and_lock_cleanup(tmp_path):
+    root = research.init_project("Corpus", tmp_path / "workspace")
+    target = research.generate_handoff(root)
+    text = target.read_text(encoding="utf-8")
+    assert "자동 생성" in text and manifest(root)["project"]["id"] in text
+    assert research.ProjectLock(root).status()["state"] == "unlocked"
+
+
+def test_windows_style_path_and_atomic_replace_are_portable(tmp_path):
+    root = research.init_project("Corpus", tmp_path / "workspace")
+    data = manifest(root)
+    data["sources"].append({
+        "id": "windows-path", "source_path": r"R:\\research-to-skill\\sources\\paper.pdf",
+        "text_file": "sources/text/windows-path.txt",
+        "metadata_file": "sources/meta/windows-path.json",
+    })
+    research._atomic_json(root / "research.json", data)
+    research._atomic_text(root / "atomic.txt", "first")
+    research._atomic_text(root / "atomic.txt", "second")
+    assert (root / "atomic.txt").read_text(encoding="utf-8") == "second"
+    assert research.ResearchProject(root).manifest["sources"][0]["source_path"].startswith("R:")

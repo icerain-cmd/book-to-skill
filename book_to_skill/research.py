@@ -7,14 +7,18 @@ only files, hashes, identifiers, provenance, schemas, dependency checks and plan
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 import re
+import socket
+import subprocess
 import sys
 import tempfile
+import uuid
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -22,6 +26,8 @@ from book_to_skill.exceptions import ExtractionError
 from book_to_skill.utils import extract_single_file, resolve_input_files
 
 MANIFEST_NAME = "research.json"
+LOCK_NAME = ".research-to-skill.lock"
+LOCK_TTL_SECONDS = 2 * 60 * 60
 SCHEMA_VERSION = 1
 COMPILER_VERSION = "1"
 CLAIM_ORIGINS = {"author", "external", "mixed", "uncertain"}
@@ -45,8 +51,136 @@ class ManifestError(ResearchError):
     """The canonical manifest cannot be read or validated."""
 
 
+class ResearchLockError(ResearchError):
+    """A write operation cannot safely acquire or release the project lock."""
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _parse_iso(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _local_identity() -> Dict[str, str]:
+    config_path = Path.home() / ".config" / "research-to-skill" / "config.json"
+    config: Dict[str, Any] = {}
+    if config_path.is_file():
+        try:
+            loaded = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                config = loaded
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+    return {
+        "agent": str(config.get("agent") or os.environ.get("RESEARCH_TO_SKILL_AGENT") or "local"),
+        "machine": str(config.get("machine") or socket.gethostname()),
+    }
+
+
+class ProjectLock:
+    """Portable writer lock based only on exclusive file creation."""
+
+    def __init__(self, root: Path):
+        self.root = root.expanduser().resolve()
+        self.path = self.root / LOCK_NAME
+
+    def status(self) -> Dict[str, Any]:
+        if not self.path.exists():
+            return {"state": "unlocked", "path": str(self.path), "lock": None}
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            return {
+                "state": "invalid", "path": str(self.path), "lock": None,
+                "warning": f"Cannot read research lock: {exc}",
+            }
+        stale = False
+        try:
+            stale = _parse_iso(str(value.get("expires_at"))) <= datetime.now(timezone.utc)
+        except (TypeError, ValueError):
+            return {
+                "state": "invalid", "path": str(self.path), "lock": value,
+                "warning": "Research lock has an invalid expires_at value.",
+            }
+        result = {"state": "stale" if stale else "locked", "path": str(self.path), "lock": value}
+        if stale:
+            result["warning"] = "WARNING: stale research lock detected"
+        return result
+
+    def acquire(
+        self, owner: Optional[str], operation: str, ttl_seconds: int = LOCK_TTL_SECONDS
+    ) -> Dict[str, Any]:
+        identity = _local_identity()
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        value = {
+            "schema_version": 1,
+            "owner": owner or identity["agent"],
+            "host": identity["machine"],
+            "pid": os.getpid(),
+            "operation": operation,
+            "created_at": now.isoformat(),
+            "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat(),
+        }
+        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as exc:
+            current = self.status()
+            lock = current.get("lock") or {}
+            details = ", ".join(
+                f"{key}={lock.get(key)!r}"
+                for key in ("owner", "host", "operation", "created_at", "expires_at")
+            )
+            warning = " WARNING: stale research lock detected; use 'lock break --force'." if current["state"] == "stale" else ""
+            raise ResearchLockError(f"Research project is locked ({details}).{warning}") from exc
+        try:
+            payload = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            self.path.unlink(missing_ok=True)
+            raise
+        return value
+
+    def release(
+        self, owner: Optional[str] = None, expected_lock: Optional[Dict[str, Any]] = None
+    ) -> None:
+        status = self.status()
+        if status["state"] == "unlocked":
+            return
+        lock = status.get("lock") or {}
+        identity = _local_identity()
+        expected_owner = owner or identity["agent"]
+        if expected_lock is not None and lock != expected_lock:
+            raise ResearchLockError("Research lock changed before release; refusing to remove it.")
+        if lock.get("owner") != expected_owner or lock.get("host") != identity["machine"]:
+            raise ResearchLockError(
+                "Refusing to release another writer's lock; use 'lock break --force' if intentional."
+            )
+        self.path.unlink()
+
+    def break_lock(self, force: bool = False) -> None:
+        if not force:
+            raise ResearchLockError("Breaking a research lock requires --force.")
+        self.path.unlink(missing_ok=True)
+
+
+@contextmanager
+def _write_lock(root: Path, operation: str, owner: Optional[str] = None):
+    lock = ProjectLock(root)
+    value = lock.acquire(owner, operation)
+    try:
+        yield value
+    finally:
+        try:
+            lock.release(str(value["owner"]), expected_lock=value)
+        except (OSError, ResearchLockError) as exc:
+            print(f"WARNING: failed to release research lock: {exc}", file=sys.stderr)
 
 
 def _slugify(value: str) -> str:
@@ -95,8 +229,8 @@ def _validate_manifest_shape(manifest: Any) -> List[str]:
     if manifest.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"unsupported schema_version: {manifest.get('schema_version')!r}")
     project = manifest.get("project")
-    if not isinstance(project, dict) or not project.get("name") or not project.get("slug"):
-        errors.append("project.name and project.slug are required")
+    if not isinstance(project, dict) or not project.get("id") or not project.get("name") or not project.get("slug"):
+        errors.append("project.id, project.name and project.slug are required")
     elif project["slug"] != _slugify(str(project["slug"])):
         errors.append("project.slug must be a canonical filename-safe slug")
     for key in ("sources", "concepts", "claims", "relations"):
@@ -115,6 +249,14 @@ def _load_manifest(root: Path) -> Dict[str, Any]:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ManifestError(f"Cannot read {path}: {exc}") from exc
+    project = manifest.get("project")
+    if isinstance(project, dict) and project.get("name") and project.get("slug") and not project.get("id"):
+        with _write_lock(root, "project-migration"):
+            # Re-read after acquiring the lock so concurrent migration cannot replace a stable ID.
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            if not manifest.get("project", {}).get("id"):
+                manifest["project"]["id"] = str(uuid.uuid4())
+                _atomic_json(path, manifest)
     errors = _validate_manifest_shape(manifest)
     if errors:
         raise ManifestError("Invalid research.json: " + "; ".join(errors))
@@ -190,7 +332,7 @@ def _empty_manifest(name: str) -> Dict[str, Any]:
     now = _now_iso()
     return {
         "schema_version": SCHEMA_VERSION,
-        "project": {"name": name, "slug": _slugify(name)},
+        "project": {"id": str(uuid.uuid4()), "name": name, "slug": _slugify(name)},
         "sources": [], "concepts": [], "claims": [], "relations": [],
         "created_at": now, "updated_at": now,
     }
@@ -250,6 +392,12 @@ class SourceRegistry:
         self.project = project
 
     def add(
+        self, inputs: Iterable[str], extraction_mode: str = "text", install_mode: str = "no"
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+        with _write_lock(self.project.root, "add"):
+            return self._add_unlocked(inputs, extraction_mode, install_mode)
+
+    def _add_unlocked(
         self, inputs: Iterable[str], extraction_mode: str = "text", install_mode: str = "no"
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
         manifest = self.project.manifest
@@ -331,6 +479,7 @@ def project_status(root: Path) -> Dict[str, Any]:
     sources = manifest["sources"]
     dirty = sum(1 for item in sources if item.get("compiled_hash") != item.get("sha256"))
     return {
+        "project_id": manifest["project"]["id"],
         "name": manifest["project"]["name"], "slug": manifest["project"]["slug"],
         "root": str(project.root), "source_count": len(sources),
         "total_words": sum(int(item.get("words") or 0) for item in sources),
@@ -413,6 +562,11 @@ def _artifact_dependencies(root: Path, source_id: str) -> List[Tuple[str, str]]:
 
 
 def remove_source(root: Path, source_id: str, cascade: bool = False) -> List[str]:
+    with _write_lock(root, "remove"):
+        return _remove_source_unlocked(root, source_id, cascade)
+
+
+def _remove_source_unlocked(root: Path, source_id: str, cascade: bool = False) -> List[str]:
     project = ResearchProject(root)
     manifest = project.manifest
     source = next((item for item in manifest["sources"] if item.get("id") == source_id), None)
@@ -539,6 +693,10 @@ class Compiler:
         self.project = project
 
     def plan(self) -> Dict[str, Any]:
+        with _write_lock(self.project.root, "compile"):
+            return self._plan_unlocked()
+
+    def _plan_unlocked(self) -> Dict[str, Any]:
         manifest = self.project.manifest
         dirty = [s for s in manifest["sources"] if s.get("compiled_hash") != s.get("sha256")]
         plan = {
@@ -565,6 +723,10 @@ class Compiler:
         return plan
 
     def complete(self, source_ids: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+        with _write_lock(self.project.root, "complete"):
+            return self._complete_unlocked(source_ids)
+
+    def _complete_unlocked(self, source_ids: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         findings = Validator(self.project).run()
         errors = [item for item in findings if item["level"] == "ERROR"]
         if errors:
@@ -724,6 +886,114 @@ def validate_project(root: Path) -> List[Dict[str, str]]:
     return Validator(ResearchProject(root)).run()
 
 
+def _git_output(arguments: Sequence[str], cwd: Path) -> Optional[str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(cwd), *arguments], check=False, capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        return None
+    return completed.stdout.strip() if completed.returncode == 0 else None
+
+
+def _find_git_repository(project_root: Path) -> Optional[Path]:
+    candidates = [Path.cwd(), project_root, *project_root.parents]
+    for parent in project_root.parents:
+        candidates.append(parent / "repo")
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        if resolved in seen or not resolved.exists():
+            continue
+        seen.add(resolved)
+        top = _git_output(["rev-parse", "--show-toplevel"], resolved)
+        if top:
+            return Path(top)
+    return None
+
+
+def project_preflight(root: Path) -> Dict[str, Any]:
+    project = ResearchProject(root)
+    status = project_status(project.root)
+    findings = validate_project(project.root)
+    errors = [item for item in findings if item["level"] == "ERROR"]
+    warnings = [item for item in findings if item["level"] == "WARN"]
+    lock_status = ProjectLock(project.root).status()
+    git_root = _find_git_repository(project.root)
+    git_data: Dict[str, Any] = {
+        "repository": str(git_root) if git_root else None,
+        "branch": None,
+        "status": None,
+    }
+    if git_root:
+        git_data["branch"] = _git_output(["branch", "--show-current"], git_root)
+        porcelain = _git_output(["status", "--short"], git_root)
+        git_data["status"] = "clean" if porcelain == "" else porcelain
+    result = "ERROR" if errors else "READY"
+    if lock_status["state"] != "unlocked" and result == "READY":
+        result = "LOCKED"
+    return {
+        "project": status["name"], "project_id": status["project_id"],
+        "path": status["root"], "sources": status["source_count"],
+        "concepts": status["concept_count"], "claims": status["claim_count"],
+        "dirty": status["dirty_source_count"],
+        "validation": "PASS" if not errors else "ERROR",
+        "validation_warnings": warnings, "lock": lock_status,
+        "git": git_data, "result": result,
+    }
+
+
+def generate_handoff(root: Path) -> Path:
+    project = ResearchProject(root)
+    with _write_lock(project.root, "handoff"):
+        preflight = project_preflight(project.root)
+        manifest = project.manifest
+        lock_snapshot = ProjectLock(project.root).status()
+        compiled = [s.get("compiled_at") for s in manifest["sources"] if s.get("compiled_at")]
+        excluded = {MANIFEST_NAME, LOCK_NAME, "HANDOFF.md"}
+        recent = sorted(
+            (
+                path for path in project.root.rglob("*")
+                if path.is_file() and path.name not in excluded
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )[:10]
+        warnings = preflight["validation_warnings"]
+        lines = [
+            "# Research-to-Skill Agent Handoff", "",
+            "_이 파일은 `research-to-skill handoff`가 자동 생성했습니다._", "",
+            f"- Timestamp: `{_now_iso()}`",
+            f"- Project ID: `{preflight['project_id']}`",
+            f"- Project: {preflight['project']}",
+            f"- Sources / Concepts / Claims: {preflight['sources']} / {preflight['concepts']} / {preflight['claims']}",
+            f"- Dirty sources: {preflight['dirty']}",
+            f"- Validation: {preflight['validation']}",
+            f"- Latest compilation: `{max(compiled) if compiled else 'none'}`", "",
+            "## Current lock", "",
+            "```json", json.dumps(lock_snapshot, ensure_ascii=False, indent=2), "```", "",
+            "## Recently changed artifacts", "",
+        ]
+        lines.extend(
+            f"- `{path.relative_to(project.root).as_posix()}`" for path in recent
+        )
+        lines.extend(["", "## Unresolved warnings", ""])
+        if warnings:
+            lines.extend(f"- [{item['code']}] {item['message']}" for item in warnings)
+        else:
+            lines.append("- None")
+        recommendation = (
+            "Resolve validation errors before any write operation."
+            if preflight["validation"] == "ERROR"
+            else "Run preflight, acquire the appropriate writer lock, and review git status before editing."
+        )
+        lines.extend(["", "## Recommended next action", "", recommendation, ""])
+        target = project.root / "HANDOFF.md"
+        _atomic_text(target, "\n".join(lines))
+        return target
+
+
 def export_project(root: Path, export_format: str, output: Optional[Path] = None) -> Path:
     project = ResearchProject(root)
     manifest = project.manifest
@@ -800,6 +1070,25 @@ def build_parser() -> argparse.ArgumentParser:
     export_cmd.add_argument("--format", choices=("skill", "json", "markdown"), required=True)
     export_cmd.add_argument("--output", type=Path)
     export_cmd.add_argument("--project", type=Path, default=Path.cwd())
+    lock_cmd = sub.add_parser("lock", help="Inspect or manage the portable project writer lock")
+    lock_sub = lock_cmd.add_subparsers(dest="lock_command", required=True)
+    lock_status_cmd = lock_sub.add_parser("status", help="Show current writer lock")
+    lock_status_cmd.add_argument("--project", type=Path, default=Path.cwd())
+    lock_acquire_cmd = lock_sub.add_parser("acquire", help="Acquire the writer lock")
+    lock_acquire_cmd.add_argument("--project", type=Path, default=Path.cwd())
+    lock_acquire_cmd.add_argument("--owner")
+    lock_acquire_cmd.add_argument("--operation", required=True)
+    lock_acquire_cmd.add_argument("--ttl", type=int, default=LOCK_TTL_SECONDS)
+    lock_release_cmd = lock_sub.add_parser("release", help="Release a lock owned on this machine")
+    lock_release_cmd.add_argument("--project", type=Path, default=Path.cwd())
+    lock_release_cmd.add_argument("--owner")
+    lock_break_cmd = lock_sub.add_parser("break", help="Force-remove a writer lock")
+    lock_break_cmd.add_argument("--project", type=Path, default=Path.cwd())
+    lock_break_cmd.add_argument("--force", action="store_true")
+    preflight_cmd = sub.add_parser("preflight", help="Check project, lock, validation, and Git state")
+    preflight_cmd.add_argument("--project", type=Path, default=Path.cwd())
+    handoff_cmd = sub.add_parser("handoff", help="Generate HANDOFF.md for the next agent")
+    handoff_cmd.add_argument("--project", type=Path, default=Path.cwd())
     return parser
 
 
@@ -841,6 +1130,28 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 1 if any(item["level"] == "ERROR" for item in findings) else 0
         elif args.command == "export":
             print(f"Exported: {export_project(args.project, args.format, args.output)}")
+        elif args.command == "lock":
+            lock = ProjectLock(args.project)
+            if args.lock_command == "status":
+                print(json.dumps(lock.status(), ensure_ascii=False, indent=2))
+            elif args.lock_command == "acquire":
+                if args.ttl <= 0:
+                    raise ResearchLockError("Lock TTL must be greater than zero.")
+                print(json.dumps(
+                    lock.acquire(args.owner, args.operation, args.ttl), ensure_ascii=False, indent=2
+                ))
+            elif args.lock_command == "release":
+                lock.release(args.owner)
+                print("Research lock released.")
+            elif args.lock_command == "break":
+                lock.break_lock(args.force)
+                print("Research lock forcefully removed.")
+        elif args.command == "preflight":
+            result = project_preflight(args.project)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 1 if result["result"] == "ERROR" else 0
+        elif args.command == "handoff":
+            print(f"Generated handoff: {generate_handoff(args.project)}")
         return 0
     except (ResearchError, FileExistsError, FileNotFoundError, OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
