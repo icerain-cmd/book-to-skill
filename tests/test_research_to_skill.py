@@ -323,3 +323,178 @@ def test_windows_style_path_and_atomic_replace_are_portable(tmp_path):
     research._atomic_text(root / "atomic.txt", "second")
     assert (root / "atomic.txt").read_text(encoding="utf-8") == "second"
     assert research.ResearchProject(root).manifest["sources"][0]["source_path"].startswith("R:")
+
+
+def semantic_workspace(tmp_path):
+    root = research.init_project("Corpus", tmp_path / "workspace")
+    data = manifest(root)
+    data["concepts"] = [{"id": "alpha", "name": "Alpha", "versions": []}]
+    data["claims"] = [{
+        "id": "claim-001", "text": "Canonical claim", "origin": "author",
+        "source_ids": [], "concept_ids": ["alpha"], "evidence": [],
+    }]
+    research._atomic_json(root / "research.json", data)
+    research._atomic_text(
+        root / "concepts/alpha.md",
+        "# Alpha\n\n## Supporting claims\n\n_None._\n\n## Sources\n\n_None._\n",
+    )
+    research._atomic_json(root / "claims/claim-001.json", data["claims"][0])
+    return root
+
+
+def test_sync_artifacts_matches_manifest_and_is_idempotent(tmp_path):
+    root = semantic_workspace(tmp_path)
+    first = research.synchronize_derived_artifacts(root)
+    assert first == {
+        "concept_artifacts_changed": 1,
+        "claim_artifacts_changed": 0,
+        "topic_index_changed": 1,
+    }
+    assert research.synchronize_derived_artifacts(root) == {
+        "concept_artifacts_changed": 0,
+        "claim_artifacts_changed": 0,
+        "topic_index_changed": 0,
+    }
+    assert research._markdown_section(
+        (root / "concepts/alpha.md").read_text(encoding="utf-8"), "Supporting claims"
+    ) == "- claim-001"
+    assert (root / "topic-index.md").read_text(encoding="utf-8") == research._render_topic_index(
+        manifest(root)
+    )
+    assert not [item for item in research.validate_project(root) if item["level"] == "ERROR"]
+
+
+def test_validate_detects_missing_and_dangling_supporting_claims(tmp_path):
+    root = semantic_workspace(tmp_path)
+    findings = research.validate_project(root)
+    assert any(
+        item["code"] == "stale-concept-artifact" and "claim-001" in item["message"]
+        for item in findings
+    )
+    path = root / "concepts/alpha.md"
+    research._atomic_text(
+        path,
+        research._replace_markdown_section(
+            path.read_text(encoding="utf-8"), "Supporting claims", "- claim-999"
+        ),
+    )
+    codes = {item["code"] for item in research.validate_project(root)}
+    assert "dangling-supporting-claim" in codes
+    assert "stale-concept-artifact" in codes
+
+
+def test_validate_detects_topic_and_claim_artifact_drift(tmp_path):
+    root = semantic_workspace(tmp_path)
+    research.synchronize_derived_artifacts(root)
+    (root / "topic-index.md").write_text(
+        "# Topic Index\n\n| Concept | Start here | Supporting claims |\n"
+        "|---|---|---|\n| Alpha | `concepts/alpha.md` | `claim-999` |\n",
+        encoding="utf-8",
+    )
+    artifact = json.loads((root / "claims/claim-001.json").read_text(encoding="utf-8"))
+    artifact["concept_ids"] = []
+    research._atomic_json(root / "claims/claim-001.json", artifact)
+    codes = {item["code"] for item in research.validate_project(root)}
+    assert {"dangling-topic-claim", "stale-topic-index", "claim-artifact-drift"} <= codes
+
+
+def test_locator_validation_and_evidence_source_mismatch(tmp_path):
+    claim = {
+        "id": "claim-locator", "text": "x", "origin": "author",
+        "source_ids": ["source-a"], "concept_ids": [],
+        "evidence": [{
+            "source_id": "source-b", "evidence_type": "explicit",
+            "locator": {"page": 0, "section": " ", "paragraph": None},
+        }],
+    }
+    errors = research.ClaimRegistry.validate(claim)
+    assert any("positive integer" in error for error in errors)
+    assert any("non-empty string" in error for error in errors)
+    claim["evidence"][0]["locator"] = {"page": None, "section": None, "paragraph": None}
+    assert "evidence locator cannot be empty" in research.ClaimRegistry.validate(claim)
+
+    root = research.init_project("Locator", tmp_path / "locator-workspace")
+    data = manifest(root)
+    data["sources"] = [
+        {"id": source_id, "sha256": source_id, "compiled_hash": source_id,
+         "text_file": f"sources/text/{source_id}.txt",
+         "metadata_file": f"sources/meta/{source_id}.json"}
+        for source_id in ("source-a", "source-b")
+    ]
+    for source in data["sources"]:
+        research._atomic_text(root / source["text_file"], "source")
+        research._atomic_json(root / source["metadata_file"], source)
+    claim["evidence"][0]["locator"] = {"page": 90, "section": "2.2 Section", "paragraph": None}
+    data["claims"] = [claim]
+    research._atomic_json(root / "research.json", data)
+    research._atomic_json(root / "claims/claim-locator.json", claim)
+    research._atomic_text(root / "topic-index.md", research._render_topic_index(data))
+    assert any(
+        item["code"] == "evidence-source-mismatch" for item in research.validate_project(root)
+    )
+
+
+def test_corrected_locator_regression():
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/research-locator-corrections.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert set(fixture) == {"claim-014", "claim-017"}
+    for claim_id, locator in fixture.items():
+        claim = {
+            "id": claim_id, "text": "unchanged", "origin": "author",
+            "source_ids": ["artificial-nature"], "concept_ids": [],
+            "evidence": [{
+                "source_id": "artificial-nature", "evidence_type": "explicit",
+                "locator": locator,
+            }],
+        }
+        assert not research.ClaimRegistry.validate(claim)
+
+
+def test_sync_rejects_unsafe_artifact_ids(tmp_path):
+    root = semantic_workspace(tmp_path)
+    data = manifest(root)
+    data["concepts"][0]["id"] = "../../outside"
+    research._atomic_json(root / "research.json", data)
+    with pytest.raises(research.ResearchError, match="Unsafe concept ID"):
+        research.synchronize_derived_artifacts(root)
+    assert research.ProjectLock(root).status()["state"] == "unlocked"
+
+
+def test_complete_consumes_semantic_results_and_syncs_views(tmp_path):
+    root = semantic_workspace(tmp_path)
+    research.synchronize_derived_artifacts(root)
+    data = manifest(root)
+    research._atomic_json(root / "semantic-results.json", {
+        "concepts": data["concepts"],
+        "claims": data["claims"],
+        "relations": data["relations"],
+    })
+    completed = research.complete_compilation(root)
+    assert completed["semantic_results_merged"] is True
+    assert completed["derived_artifacts"] == {
+        "concept_artifacts_changed": 0,
+        "claim_artifacts_changed": 0,
+        "topic_index_changed": 0,
+    }
+    assert not (root / "semantic-results.json").exists()
+
+
+def test_duplicate_concept_ids_are_rejected():
+    errors = research.ClaimRegistry.validate({
+        "id": "claim-duplicate", "text": "x", "origin": "author",
+        "concept_ids": ["alpha", "alpha"], "evidence": [],
+    })
+    assert "claim concept_ids must not contain duplicates" in errors
+
+
+def test_mixed_origin_semantics_are_documented():
+    schema = (Path(research.__file__).parent.parent / "docs/research-schema.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Multiple sources alone never justify" in schema
+    assert not research.ClaimRegistry.validate({
+        "id": "claim-mixed", "text": "synthesis", "origin": "mixed", "evidence": []
+    })
