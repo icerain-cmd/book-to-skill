@@ -53,6 +53,10 @@ nav:
   - Install: install.md
   - FAQ: faq.md
   - Architecture: architecture.md
+  - Research-to-Skill: research-to-skill.md
+  - Research Architecture: research-architecture.md
+  - Research Schema: research-schema.md
+  - Research CLI: research-cli.md
   - Performance: performance.md
   - Skill Reference: skill-reference.md
 

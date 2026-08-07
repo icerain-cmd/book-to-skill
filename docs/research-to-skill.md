@@ -1,70 +1,66 @@
-# research-to-skill MVP
+# Research-to-Skill guide
 
-`research-to-skill` extends book-to-skill from one-shot document conversion into an incrementally growing, provenance-aware research workspace.
+`research-to-skill` turns a growing collection of papers, books, notes, and
+reports into auditable research memory. It is additive: the original
+`book-to-skill` command and workflow remain unchanged.
 
-## Design goals
+## Quick start
 
-1. Preserve upstream `book-to-skill` behavior and file formats.
-2. Reuse the existing deterministic extraction layer instead of duplicating parsers.
-3. Treat research as a long-lived corpus: sources can be added over time and duplicate files are ignored by SHA-256.
-4. Keep provenance next to extracted text so later concept, argument, and citation synthesis can point back to an exact source.
-5. Separate deterministic ingestion from agent-driven synthesis.
+```bash
+research-to-skill init "My Research" --dir ./my-research
+research-to-skill add ./papers ./books ./notes --project ./my-research
+research-to-skill status --project ./my-research
+research-to-skill compile --project ./my-research
+research-to-skill validate --project ./my-research
+```
+
+`add` recursively resolves supported files through the existing extraction
+pipeline. Identical content is skipped by SHA-256, including a renamed copy.
+Failures are reported per file and do not discard successful files from a batch.
 
 ## Commands
 
-```bash
-research-to-skill init "Mechanocene Research" --dir ./mechanocene-research
-research-to-skill add ./papers/*.pdf --project ./mechanocene-research
-research-to-skill status --project ./mechanocene-research
-```
+| Command | Purpose |
+| --- | --- |
+| `init NAME [--dir PATH]` | Create a canonical research workspace. |
+| `add INPUT... [--project PATH]` | Extract and register one or more sources. |
+| `remove ID [--cascade]` | Remove a source; block when artifacts depend on it. |
+| `status` | Show corpus totals and dirty-source count. |
+| `list` | List registered sources and hashes. |
+| `inspect {source,concept,claim} ID` | Print a record as JSON. |
+| `compile` | Write a provider-independent incremental compilation plan. |
+| `validate` | Report `PASS`, `WARN`, and `ERROR` integrity findings. |
+| `export --format {skill,json,markdown}` | Export a ZIP skill or portable view. |
 
-For technical PDFs with tables, formulas, or complex layouts:
+All commands except `init` accept `--project`; it defaults to the current
+directory. Use `--mode technical` for structure-heavy documents and
+`--install-missing ask|yes|no` to control optional extractor installation.
 
-```bash
-research-to-skill add paper.pdf \
-  --project ./mechanocene-research \
-  --mode technical \
-  --install-missing ask
-```
+## Semantic compilation
 
-## Workspace layout
+`compile` does not call an LLM. It writes `compile-plan.json` containing only
+sources whose current hash differs from `compiled_hash`. A compatible host agent
+reads that plan and the generated `SKILL.md`, then creates or merges concepts,
+claims, arguments, papers, and graph records. This keeps provider choice outside
+the deterministic data layer.
 
-```text
-mechanocene-research/
-├── SKILL.md
-├── research.json
-├── sources/
-│   ├── text/          # deterministic extracted text
-│   └── meta/          # one provenance record per source
-├── concepts/          # phase 2: concept definitions + evolution
-├── arguments/         # phase 2: claims/counterclaims + evidence
-├── citations/         # phase 2: source-backed citation records
-└── papers/            # phase 2: publication-level syntheses
-```
+After the host has written artifacts and `validate` reports no errors, it runs
+`compile --complete SOURCE_ID...` to atomically record compiled hashes and advance
+semantic versions. Omitting IDs finalizes all registered sources.
 
-`research.json` is the canonical project manifest. Each source record includes the original path, SHA-256 digest, extraction method, format, word/token estimates, structure metadata, and the paths of its extracted text and provenance record.
+The retrieval order is concepts → claims → arguments → papers → sources. The
+agent descends to source text only when it needs evidence, a locator, or conflict
+resolution.
 
-## Why this layer is separate from book-to-skill
+## Safe removal
 
-The upstream project already handles multi-source extraction, but its primary output is a generated skill for a bounded input set. Research projects have additional lifecycle requirements:
+`remove SOURCE_ID` refuses to proceed when claims, concepts, arguments,
+citations, or paper records depend on the source. `--cascade` is explicit and
+also removes dependent graph nodes and edges. Back up or export the workspace
+before a cascade removal.
 
-- new material arrives continuously;
-- the same paper must not be ingested twice;
-- source identity and provenance must survive later synthesis;
-- concepts may change meaning across publications and time;
-- the researcher's own claims must eventually be distinguishable from claims in external literature.
+## Attribution
 
-The MVP solves the ingestion and persistence portion first. It intentionally does not ask an LLM to invent concept files during `add`.
-
-## Next compiler layer
-
-The next phase should add an explicit `compile` command that reads only registered source text and produces structured records such as:
-
-```text
-concepts/mechanocene.md
-arguments/algorithmic-environment.md
-citations/<source-id>.json
-papers/<paper-id>.md
-```
-
-Each generated claim should retain source IDs and evidence locations. A later HEGI adapter can then route queries between the local Research Skill and external scholarly search.
+This research extension is maintained in a transparent fork of
+`virgiliojr94/book-to-skill`. The upstream attribution and MIT license remain in
+place. Source documents and generated research data retain their own copyrights.
