@@ -30,6 +30,7 @@ Failures are reported per file and do not discard successful files from a batch.
 | `inspect {source,concept,claim} ID` | Print a record as JSON. |
 | `compile` | Write a provider-independent incremental compilation plan. |
 | `validate` | Report `PASS`, `WARN`, and `ERROR` integrity findings. |
+| `sync-artifacts` | Regenerate derived concept, claim, and topic-index relationships from `research.json`. |
 | `export --format {skill,json,markdown}` | Export a ZIP skill or portable view. |
 
 All commands except `init` accept `--project`; it defaults to the current
@@ -46,7 +47,10 @@ the deterministic data layer.
 
 After the host has written artifacts and `validate` reports no errors, it runs
 `compile --complete SOURCE_ID...` to atomically record compiled hashes and advance
-semantic versions. Omitting IDs finalizes all registered sources.
+semantic versions. A successfully merged `semantic-results.json` is consumed so
+it cannot overwrite later canonical corrections, and derived relationship views
+are synchronized before the writer lock is released. Omitting IDs finalizes all
+registered sources.
 
 The retrieval order is concepts → claims → arguments → papers → sources. The
 agent descends to source text only when it needs evidence, a locator, or conflict
