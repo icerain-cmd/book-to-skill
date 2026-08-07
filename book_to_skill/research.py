@@ -15,7 +15,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from book_to_skill.exceptions import ExtractionError
 from book_to_skill.utils import extract_single_file, resolve_input_files
@@ -63,7 +63,7 @@ def _save_manifest(root: Path, manifest: Dict[str, Any]) -> None:
     )
 
 
-def init_project(name: str, directory: Path | None = None) -> Path:
+def init_project(name: str, directory: Optional[Path] = None) -> Path:
     root = (directory or Path(name)).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
 
@@ -209,7 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: List[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "init":
