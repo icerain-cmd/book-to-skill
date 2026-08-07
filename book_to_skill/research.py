@@ -28,6 +28,7 @@ from book_to_skill.utils import extract_single_file, resolve_input_files
 MANIFEST_NAME = "research.json"
 LOCK_NAME = ".research-to-skill.lock"
 LOCK_TTL_SECONDS = 2 * 60 * 60
+ARTIFACT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SCHEMA_VERSION = 1
 COMPILER_VERSION = "1"
 CLAIM_ORIGINS = {"author", "external", "mixed", "uncertain"}
@@ -496,6 +497,123 @@ def list_sources(root: Path) -> List[Dict[str, Any]]:
     ]
 
 
+def _concept_claim_map(manifest: Dict[str, Any]) -> Dict[str, List[str]]:
+    mapping = {str(concept["id"]): [] for concept in manifest["concepts"]}
+    for claim in manifest["claims"]:
+        for concept_id in claim.get("concept_ids") or []:
+            mapping.setdefault(str(concept_id), []).append(str(claim["id"]))
+    return mapping
+
+
+def _markdown_section(text: str, heading: str) -> Optional[str]:
+    match = re.search(
+        rf"^## {re.escape(heading)}\n\n(?P<body>.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL
+    )
+    return match.group("body").rstrip() if match else None
+
+
+def _replace_markdown_section(text: str, heading: str, body: str) -> str:
+    replacement = f"## {heading}\n\n{body.rstrip()}\n\n"
+    pattern = rf"^## {re.escape(heading)}\n\n.*?(?=^## |\Z)"
+    if re.search(pattern, text, re.MULTILINE | re.DOTALL):
+        return re.sub(pattern, replacement, text, count=1, flags=re.MULTILINE | re.DOTALL).rstrip() + "\n"
+    return text.rstrip() + "\n\n" + replacement
+
+
+def _supporting_claim_refs(section: str) -> Tuple[List[str], List[str]]:
+    if section.strip() == "_None._":
+        return [], []
+    refs: List[str] = []
+    malformed: List[str] = []
+    for line in section.splitlines():
+        if not line.strip():
+            continue
+        match = re.fullmatch(r"\s*-\s+`?([A-Za-z0-9][A-Za-z0-9._-]*)`?\s*", line)
+        if match:
+            refs.append(match.group(1))
+        else:
+            malformed.append(line.strip())
+    return refs, malformed
+
+
+def _topic_claim_refs(topic: str) -> List[str]:
+    refs: List[str] = []
+    for line in topic.splitlines():
+        if not line.startswith("|") or line.startswith("|---"):
+            continue
+        columns = line.split("|")
+        if len(columns) >= 5 and columns[1].strip() != "Concept":
+            refs.extend(re.findall(r"`([A-Za-z0-9][A-Za-z0-9._-]*)`", columns[3]))
+    return refs
+
+
+def _render_topic_index(manifest: Dict[str, Any]) -> str:
+    mapping = _concept_claim_map(manifest)
+    lines = [
+        "# Topic Index", "",
+        "_Derived from canonical `research.json`; do not edit relationships here._", "",
+        "| Concept | Start here | Supporting claims |",
+        "|---|---|---|",
+    ]
+    for concept in manifest["concepts"]:
+        concept_id = str(concept["id"])
+        name = str(concept.get("name") or concept_id).replace("|", "\\|")
+        claims = ", ".join(f"`{claim_id}`" for claim_id in mapping.get(concept_id, [])) or "—"
+        lines.append(f"| {name} | `concepts/{concept_id}.md` | {claims} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _synchronize_derived_artifacts_unlocked(
+    project: ResearchProject, manifest: Dict[str, Any]
+) -> Dict[str, int]:
+    mapping = _concept_claim_map(manifest)
+    changed_concepts = 0
+    for concept in manifest["concepts"]:
+        concept_id = str(concept["id"])
+        if not ARTIFACT_ID_PATTERN.fullmatch(concept_id):
+            raise ResearchError(f"Unsafe concept ID for derived artifact: {concept_id!r}")
+        path = _safe_project_path(project.root, f"concepts/{concept_id}.md")
+        if not path.is_file():
+            continue
+        old = path.read_text(encoding="utf-8")
+        claims = mapping.get(concept_id, [])
+        body = "\n".join(f"- {claim_id}" for claim_id in claims) if claims else "_None._"
+        new = _replace_markdown_section(old, "Supporting claims", body)
+        if new != old:
+            _atomic_text(path, new)
+            changed_concepts += 1
+    changed_claims = 0
+    for claim in manifest["claims"]:
+        claim_id = str(claim["id"])
+        if not ARTIFACT_ID_PATTERN.fullmatch(claim_id):
+            raise ResearchError(f"Unsafe claim ID for derived artifact: {claim_id!r}")
+        path = _safe_project_path(project.root, f"claims/{claim_id}.json")
+        if not path.is_file():
+            continue
+        artifact = _load_json_artifact(path)
+        if artifact.get("concept_ids") != claim.get("concept_ids"):
+            artifact["concept_ids"] = list(claim.get("concept_ids") or [])
+            _atomic_json(path, artifact)
+            changed_claims += 1
+    topic = _render_topic_index(manifest)
+    topic_path = project.root / "topic-index.md"
+    topic_changed = int(not topic_path.is_file() or topic_path.read_text(encoding="utf-8") != topic)
+    if topic_changed:
+        _atomic_text(topic_path, topic)
+    return {
+        "concept_artifacts_changed": changed_concepts,
+        "claim_artifacts_changed": changed_claims,
+        "topic_index_changed": topic_changed,
+    }
+
+
+def synchronize_derived_artifacts(root: Path) -> Dict[str, int]:
+    project = ResearchProject(root)
+    with _write_lock(project.root, "sync-artifacts"):
+        return _synchronize_derived_artifacts_unlocked(project, project.manifest)
+
+
 def _load_json_artifact(path: Path) -> Dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -645,14 +763,35 @@ class ClaimRegistry:
         errors: List[str] = []
         if not claim.get("id") or not claim.get("text"):
             errors.append("claim id and text are required")
+        elif not ARTIFACT_ID_PATTERN.fullmatch(str(claim["id"])):
+            errors.append("claim id must be filename-safe ASCII")
         if claim.get("origin") not in CLAIM_ORIGINS:
             errors.append(f"invalid claim origin: {claim.get('origin')!r}")
         confidence = claim.get("confidence")
         if confidence is not None and (not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1):
             errors.append("claim confidence must be between 0 and 1")
+        concept_ids = claim.get("concept_ids") or []
+        if len(concept_ids) != len(set(concept_ids)):
+            errors.append("claim concept_ids must not contain duplicates")
         for evidence in claim.get("evidence", []):
             if not isinstance(evidence, dict) or evidence.get("evidence_type") not in EVIDENCE_TYPES:
                 errors.append("invalid evidence_type")
+                continue
+            locator = evidence.get("locator")
+            if locator is None:
+                continue
+            if not isinstance(locator, dict):
+                errors.append("evidence locator must be an object")
+                continue
+            page = locator.get("page")
+            if page is not None and (isinstance(page, bool) or not isinstance(page, int) or page < 1):
+                errors.append("locator page must be a positive integer or null")
+            for key in ("section", "paragraph"):
+                value = locator.get(key)
+                if value is not None and (not isinstance(value, str) or not value.strip()):
+                    errors.append(f"locator {key} must be a non-empty string or null")
+            if all(locator.get(key) is None for key in ("page", "section", "paragraph")):
+                errors.append("evidence locator cannot be empty")
         return errors
 
 
@@ -662,6 +801,8 @@ class ConceptRegistry:
         errors: List[str] = []
         if not concept.get("id"):
             errors.append("concept id is required")
+        elif not ARTIFACT_ID_PATTERN.fullmatch(str(concept["id"])):
+            errors.append("concept id must be filename-safe ASCII")
         for version in concept.get("versions", []):
             if not isinstance(version, dict) or not version.get("source_id"):
                 errors.append("concept versions require source_id")
@@ -733,7 +874,8 @@ class Compiler:
             raise ResearchError("Cannot finalize compilation while validation errors exist.")
         manifest = self.project.manifest
         results_path = self.project.root / "semantic-results.json"
-        if results_path.is_file():
+        results_merged = results_path.is_file()
+        if results_merged:
             results = _load_json_artifact(results_path)
             for key, validator in (
                 ("concepts", ConceptRegistry.validate), ("claims", ClaimRegistry.validate)
@@ -783,9 +925,13 @@ class Compiler:
             _atomic_json(self.project.root / source["metadata_file"], source)
             completed.append(source["id"])
         _save_manifest(self.project.root, manifest)
+        if results_merged:
+            results_path.unlink()
+        derived = _synchronize_derived_artifacts_unlocked(self.project, manifest)
         return {
             "completed_sources": completed, "compiled_at": now,
-            "semantic_results_merged": results_path.is_file(),
+            "semantic_results_merged": results_merged,
+            "derived_artifacts": derived,
         }
 
 
@@ -850,6 +996,14 @@ class Validator:
                         "ERROR", "broken-source-ref",
                         f"claim {claim.get('id')} evidence -> {evidence.get('source_id')}",
                     )
+                elif (
+                    isinstance(evidence, dict)
+                    and evidence.get("source_id") not in (claim.get("source_ids") or [])
+                ):
+                    add(
+                        "ERROR", "evidence-source-mismatch",
+                        f"claim {claim.get('id')} evidence source is not in claim source_ids: {evidence.get('source_id')}",
+                    )
             for ref in claim.get("concept_ids") or []:
                 if ref not in concept_ids:
                     add("ERROR", "missing-concept-ref", f"claim {claim.get('id')} -> {ref}")
@@ -859,6 +1013,94 @@ class Validator:
             for version in concept.get("versions", []):
                 if isinstance(version, dict) and version.get("source_id") not in source_ids:
                     add("ERROR", "broken-source-ref", f"concept {concept.get('id')} -> {version.get('source_id')}")
+        concept_claims = _concept_claim_map(manifest)
+        claim_ids = {str(item.get("id")) for item in manifest["claims"]}
+        for concept in manifest["concepts"]:
+            concept_id = str(concept.get("id"))
+            try:
+                path = _safe_project_path(self.project.root, f"concepts/{concept_id}.md")
+            except ManifestError as exc:
+                add("ERROR", "unsafe-path", str(exc))
+                continue
+            if not path.is_file():
+                add("WARN", "missing-concept-artifact", f"missing derived concept artifact: {path}")
+                continue
+            try:
+                section = _markdown_section(path.read_text(encoding="utf-8"), "Supporting claims")
+            except (OSError, UnicodeError) as exc:
+                add("WARN", "stale-concept-artifact", f"cannot read {path}: {exc}")
+                continue
+            if section is None:
+                add("WARN", "stale-concept-artifact", f"{concept_id} has no Supporting claims section")
+                continue
+            listed, malformed = _supporting_claim_refs(section)
+            if malformed:
+                add(
+                    "ERROR", "malformed-supporting-claims",
+                    f"{concept_id} has malformed supporting claim entries: {', '.join(malformed)}",
+                )
+            dangling = [claim_id for claim_id in listed if claim_id not in claim_ids]
+            if dangling:
+                add(
+                    "ERROR", "dangling-supporting-claim",
+                    f"{concept_id} references unknown supporting claims: {', '.join(dangling)}",
+                )
+            invalid = [
+                claim_id for claim_id in listed
+                if claim_id in claim_ids and claim_id not in concept_claims.get(concept_id, [])
+            ]
+            if invalid:
+                add(
+                    "ERROR", "invalid-supporting-claim",
+                    f"{concept_id} lists claims without canonical concept_ids relation: {', '.join(invalid)}",
+                )
+            missing = [
+                claim_id for claim_id in concept_claims.get(concept_id, []) if claim_id not in listed
+            ]
+            if missing:
+                add(
+                    "WARN", "stale-concept-artifact",
+                    f"{concept_id} is missing supporting claims: {', '.join(missing)}",
+                )
+        for claim in manifest["claims"]:
+            claim_id = str(claim.get("id"))
+            try:
+                path = _safe_project_path(self.project.root, f"claims/{claim_id}.json")
+            except ManifestError as exc:
+                add("ERROR", "unsafe-path", str(exc))
+                continue
+            if not path.is_file():
+                add("WARN", "missing-claim-artifact", f"missing derived claim artifact: {path}")
+                continue
+            try:
+                artifact = _load_json_artifact(path)
+            except ResearchError as exc:
+                add("ERROR", "invalid-claim-artifact", str(exc))
+                continue
+            if artifact.get("concept_ids") != claim.get("concept_ids"):
+                add(
+                    "ERROR", "claim-artifact-drift",
+                    f"{claim_id} concept_ids differ between claim artifact and research.json",
+                )
+        topic_path = self.project.root / "topic-index.md"
+        if not topic_path.is_file():
+            add("WARN", "stale-topic-index", f"missing derived topic index: {topic_path}")
+        else:
+            try:
+                topic = topic_path.read_text(encoding="utf-8")
+                dangling = sorted(set(_topic_claim_refs(topic)) - claim_ids)
+                if dangling:
+                    add(
+                        "ERROR", "dangling-topic-claim",
+                        "topic-index.md references unknown claims: " + ", ".join(dangling),
+                    )
+                if topic != _render_topic_index(manifest):
+                    add(
+                        "WARN", "stale-topic-index",
+                        "topic-index.md does not match canonical claim-concept relationships",
+                    )
+            except (OSError, UnicodeError) as exc:
+                add("WARN", "stale-topic-index", f"cannot read topic-index.md: {exc}")
         graph_path = self.project.root / "relations" / "knowledge-graph.json"
         try:
             for message in KnowledgeGraph.validate(_load_json_artifact(graph_path)):
@@ -1089,6 +1331,10 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_cmd.add_argument("--project", type=Path, default=Path.cwd())
     handoff_cmd = sub.add_parser("handoff", help="Generate HANDOFF.md for the next agent")
     handoff_cmd.add_argument("--project", type=Path, default=Path.cwd())
+    sync_cmd = sub.add_parser(
+        "sync-artifacts", help="Regenerate derived claim, concept, and topic-index views"
+    )
+    sync_cmd.add_argument("--project", type=Path, default=Path.cwd())
     return parser
 
 
@@ -1152,6 +1398,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 1 if result["result"] == "ERROR" else 0
         elif args.command == "handoff":
             print(f"Generated handoff: {generate_handoff(args.project)}")
+        elif args.command == "sync-artifacts":
+            print(json.dumps(
+                synchronize_derived_artifacts(args.project), ensure_ascii=False, indent=2
+            ))
         return 0
     except (ResearchError, FileExistsError, FileNotFoundError, OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
