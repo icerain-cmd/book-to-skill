@@ -1,5 +1,7 @@
 *.pyc
 __pycache__/
+.venv/
+.test-tmp/
 
 # Agent session traces (Stone CLI) — never commit
 .stone/

@@ -92,6 +92,27 @@ The name says "book", but the input is any structured prose. The same extraction
 
 If you re-open a document often enough to wish you'd memorized it, it's a candidate.
 
+### Research-to-Skill (fork extension)
+
+This fork also provides a separate `research-to-skill` command for long-lived,
+provenance-aware research memory. It preserves `book-to-skill` while adding
+incremental source ingestion, claim identity (`author` vs. `external`), concept
+evolution, safe removal, integrity validation, and provider-independent semantic
+compilation plans.
+
+```bash
+research-to-skill init "My Research" --dir ./my-research
+research-to-skill add ./papers ./notes --project ./my-research
+research-to-skill compile --project ./my-research
+research-to-skill validate --project ./my-research
+```
+
+See the [Research-to-Skill guide](docs/research-to-skill.md),
+[architecture](docs/research-architecture.md), [schema](docs/research-schema.md),
+and [CLI reference](docs/research-cli.md). This repository remains a transparent
+fork of `virgiliojr94/book-to-skill`; its upstream attribution and MIT license are
+unchanged.
+
 ---
 
 
